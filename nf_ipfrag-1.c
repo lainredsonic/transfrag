@@ -18,6 +18,8 @@
 
 char intf[255]; 
 int rawfd;
+int frag_size = 2;
+int frag_intv = 10; //ms
 
 
 static inline unsigned short from32to16(unsigned a) 
@@ -369,29 +371,19 @@ static uint16_t checksum (uint16_t *addr, int len)
 	return (answer);
 }
 
-int process_pkt_1(struct nfq_q_handle *qh, struct nfq_data *nfa)
+int process_pkt_1(unsigned char *data, u_int16_t pkt_len)
 {
-	u_int16_t pkt_len;
 	u_int16_t pkt1_len;
 	u_int16_t pkt2_len;
-//	int rawfd;
 	struct ip_pkt *ipk = NULL;
 	struct ip_pkt *ipk2 = NULL;
 	struct sockaddr_in da;
-	unsigned char *data = NULL;
 	unsigned char data2[3500];
 	char *strloc = NULL;
 	int offset;
-	int tcp_seg_len;
 	char request[3500] = {0,};
 	u_int16_t tcp_hdr_len = 0;
 
-	u_int32_t id;
-        struct nfqnl_msg_packet_hdr *ph;
-	ph = nfq_get_msg_packet_hdr(nfa);	
-	id = ntohl(ph->packet_id);
-
-	pkt_len = nfq_get_payload(nfa, &data);
 	ipk = (struct ip_pkt *)data;
 	ipk2 = (struct ip_pkt *)data2;
 
@@ -401,27 +393,26 @@ int process_pkt_1(struct nfq_q_handle *qh, struct nfq_data *nfa)
 		ipk->iph.ttl = 199;
 		ipk->iph.check = 0;
 		ipk->iph.check = checksum((uint16_t *)data, 20);
-		nfq_set_verdict(qh, id, NF_ACCEPT, pkt_len, data);
+//		nfq_set_verdict(qh, id, NF_ACCEPT, pkt_len, data);
 		printf("pass\n");
 		return PKT_ACCEPT;
 	}
-	
+
 	tcp_hdr_len = ipk->tcph.th_off * 4;
 
 	if(strloc = strstr((char *)ipk+20+tcp_hdr_len, "GET")){
-//		offset = strloc-ipk->u_payload;
 		offset = strloc-(char *)data;
 		if(ntohs(ipk->iph.tot_len)-offset<=0){			//扫到上次缓冲区残馀数据的部分
-			nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+//			nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 			printf("offset\n");
 			return PKT_ACCEPT;
 		}
 		strncpy(request, strloc, ntohs(ipk->iph.tot_len)-offset);
-		printf("tcp_request:%s, str_tcp_offset:%d\n", request, offset);
+		printf("str_tcp_offset:%d\ntcp_request:\n%s", offset, request);
 		memset(request, 0, 3500);
 	}else{
 		printf("not found\n");	
-		nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+//		nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 		return PKT_ACCEPT;
 	}
 //	offset += 5; //skip "GET "
@@ -455,52 +446,42 @@ int process_pkt_1(struct nfq_q_handle *qh, struct nfq_data *nfa)
 	memset(&da, 0, sizeof(struct sockaddr));
 	da.sin_addr.s_addr = (ipk->iph).daddr;
 
-		printf("pkt1_len:%d\n", pkt1_len);
-		printf("pkt2_len:%d\n", pkt2_len);
+//    printf("pkt1_len:%d\n", pkt1_len);
+//    printf("pkt2_len:%d\n", pkt2_len);
+
 	if(sendto(rawfd, data, pkt1_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
 		perror("sendto1 failed");
-		printf("pkt1_len:%d\n", pkt1_len);
 		exit(errno);
 	}
-    usleep(400000);
+
+    usleep(frag_intv*1000);
+
 	if(sendto(rawfd, data2, pkt2_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
 		perror("sendto2 failed");
-		printf("pkt2_len:%d\n", pkt2_len);
 		exit(errno);
 	}
 
-
-//	sleep(4);
-
-//	close(rawfd);
-	nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+//	nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 	return PKT_DROP;
 }
-	
-int process_pkt(struct nfq_q_handle *qh, struct nfq_data *nfa)
+
+
+int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
 {
-	u_int16_t pkt_len;
 	u_int16_t pkt1_len;
 	u_int16_t pkt2_len;
-//	int rawfd;
+	int16_t rest_payload_len;
 	struct ip_pkt *ipk = NULL;
 	struct ip_pkt *ipk2 = NULL;
 	struct sockaddr_in da;
-	unsigned char *data = NULL;
 	unsigned char data2[3500];
 	char *strloc = NULL;
 	int offset;
-	int tcp_seg_len;
 	char request[3500] = {0,};
 	u_int16_t tcp_hdr_len = 0;
+    unsigned int last_frag = 0;
+    unsigned int frag_count = 0;
 
-	u_int32_t id;
-
-        struct nfqnl_msg_packet_hdr *ph;
-	ph = nfq_get_msg_packet_hdr(nfa);	
-	id = ntohl(ph->packet_id);
-
-	pkt_len = nfq_get_payload(nfa, &data);
 	ipk = (struct ip_pkt *)data;
 	ipk2 = (struct ip_pkt *)data2;
 
@@ -510,121 +491,120 @@ int process_pkt(struct nfq_q_handle *qh, struct nfq_data *nfa)
 		ipk->iph.ttl = 199;
 		ipk->iph.check = 0;
 		ipk->iph.check = checksum((uint16_t *)data, 20);
-		nfq_set_verdict(qh, id, NF_ACCEPT, pkt_len, data);
+//		nfq_set_verdict(qh, id, NF_ACCEPT, pkt_len, data);
+		printf("pass\n");
 		return PKT_ACCEPT;
 	}
-	
+
 	tcp_hdr_len = ipk->tcph.th_off * 4;
 
-
-	
-//	printf("tcp hdr len:%d\n", tcp_hdr_len);
-	printf("pkt_len:%d, ip tot len:%d\n",pkt_len, ntohs(ipk->iph.tot_len));
-//	dump_pkt("payload:", data, pkt_len);
-	
-	if(strloc = strstr((char *)ipk+20+tcp_hdr_len, "Host:")){
-//		offset = strloc-ipk->u_payload;
+	if(strloc = strstr((char *)ipk+20+tcp_hdr_len, "GET")){
 		offset = strloc-(char *)data;
 		if(ntohs(ipk->iph.tot_len)-offset<=0){			//扫到上次缓冲区残馀数据的部分
-			nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+//			nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+			printf("offset\n");
 			return PKT_ACCEPT;
 		}
 		strncpy(request, strloc, ntohs(ipk->iph.tot_len)-offset);
-		printf("tcp_request:%s, str_tcp_offset:%d\n", request, offset);
+		printf("str_tcp_offset:%d\ntcp_request:\n%s", offset, request);
 		memset(request, 0, 3500);
 	}else{
-		
-		nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+		printf("not found\n");	
+//		nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 		return PKT_ACCEPT;
 	}
+	offset += 2; //split "GE T " to avoid censorship
+    rest_payload_len = ntohs(ipk->iph.tot_len) - 20 - tcp_hdr_len - 2; //split "GE T " to avoid censorship
 
-//	offset = 16; //debug
-//	offset &= 0x1f8;
-	offset += 5; //skip "host: "
-	tcp_seg_len = ((offset-20)>>3)<<3;
-	memcpy(data2, data, pkt_len);
-	pkt1_len = 20 + tcp_seg_len;
-	pkt2_len = ntohs(ipk->iph.tot_len)-pkt1_len;
-	memcpy(data2+20, data+pkt1_len, pkt2_len);
-	pkt2_len += 20;   //add another ip hdr
+    memset(&da, 0, sizeof(struct sockaddr));
+    da.sin_addr.s_addr = (ipk->iph).daddr;
 
-	ipk->iph.frag_off = htons(0x20<<8); //DF flag
-	ipk->iph.ttl = 199;
-	ipk->iph.tot_len = htons(pkt1_len);
-	ipk->iph.check = 0;
-	ipk->iph.check = checksum((uint16_t *)data, 20);
+    pkt1_len = offset;
+    ipk->iph.ttl = 199;
+    ipk->iph.tot_len = htons(pkt1_len);
+    ipk->iph.check = 0;
+    ipk->iph.check = checksum((uint16_t *)data, 20);
+    ipk->tcph.th_sum = 0;
+    ipk->tcph.th_sum = csum_tcpudp_magic(ipk->iph.saddr,
+                ipk->iph.daddr,
+                pkt1_len-20, IPPROTO_TCP,
+                csum_partial((unsigned char *)(&ipk->tcph), pkt1_len-20, 0));
 
-	ipk2->iph.frag_off = htons(0x40<<8|(tcp_seg_len>>3));
-	ipk2->iph.ttl = 199;
-	ipk2->iph.tot_len = htons(pkt2_len);
-	ipk2->iph.check = 0;
-	ipk2->iph.check = checksum((uint16_t *)data2, 20);
+    if(sendto(rawfd, data, pkt1_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
+        perror("sendto1 failed");
+        exit(errno);
+    }
 
-//	dump_pkt("payload1:", data, pkt1_len);
-//	dump_pkt("payload2:", data2, pkt2_len);
-	
-/*
-	if((rawfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) <0){
-		perror("raw socket failed");
-		exit(errno);
-	}
-
-	if((setsockopt(rawfd, SOL_SOCKET, SO_BINDTODEVICE, intf, 6)) < 0){
-		perror("set BINDTODEVICE failed");
-		exit(errno);
-	}
-
-	if(setsockopt(rawfd, IPPROTO_IP, IP_HDRINCL, &s_on, sizeof(s_on)) < 0){
-		perror("set IP_HDRINCL failed");
-		exit(errno);
-	}
-*/
-
-	memset(&da, 0, sizeof(struct sockaddr));
-	da.sin_addr.s_addr = (ipk->iph).daddr;
-
-	if(sendto(rawfd, data2, pkt2_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
-		perror("sendto2 failed");
-		printf("pkt2_len:%d\n", pkt2_len);
-		exit(errno);
-	}
-
-//	sleep(4);
-
-	if(sendto(rawfd, data, pkt1_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
-		perror("sendto1 failed");
-		printf("pkt1_len:%d\n", pkt2_len);
-		exit(errno);
-	}
+    usleep(frag_intv*1000);
 
 
-//	close(rawfd);
-	nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+    while(rest_payload_len > 0 && !last_frag){
+
+        unsigned int cur_frag_size;
+
+       // printf("rest_payload_len:%d\n", rest_payload_len);
+        if(rest_payload_len < frag_size){
+            last_frag = 1;
+            cur_frag_size = rest_payload_len;
+        }
+        else
+            cur_frag_size = frag_size;
+
+        memcpy(data2, data, pkt_len);
+        pkt2_len = 20 + tcp_hdr_len + cur_frag_size;
+        memcpy(data2+20+tcp_hdr_len, data+offset+frag_count*frag_size, cur_frag_size);
+
+        ipk2->iph.ttl = 199;
+        ipk2->iph.tot_len = htons(pkt2_len);
+        ipk2->iph.check = 0;
+        ipk2->iph.check = checksum((uint16_t *)data2, 20);
+        ipk2->tcph.th_seq = htonl(ntohl(ipk->tcph.th_seq)+2+frag_count*frag_size);
+        ipk2->tcph.th_sum = 0;
+        ipk2->tcph.th_sum = csum_tcpudp_magic(ipk2->iph.saddr,
+                    ipk2->iph.daddr,
+                    pkt2_len-20, IPPROTO_TCP,
+                    csum_partial((unsigned char *)(&ipk2->tcph), pkt2_len-20, 0));
+
+        if(sendto(rawfd, data2, pkt2_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
+            perror("sendto2 failed");
+            exit(errno);
+        }
+
+        usleep(frag_intv*1000);
+
+        frag_count++;
+
+        rest_payload_len -= frag_size;
+        /*
+        if(frag_count > 100){
+            printf("too many frags\n");
+            break;
+        }
+        */
+    }
+
+//	nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 	return PKT_DROP;
 }
 
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *nfa, void *data)
 {
 //	u_int32_t id = print_pkt(nfa);
+
 	int ret = 0;
-/*
-	u_int32_t id;
+	unsigned char *pkt_data = NULL;
 
-        struct nfqnl_msg_packet_hdr *ph;
-	ph = nfq_get_msg_packet_hdr(nfa);	
-	id = ntohl(ph->packet_id);
-*/
+    struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(nfa);
+	u_int32_t id = ntohl(ph->packet_id);
+	u_int16_t pkt_len = nfq_get_payload(nfa, &pkt_data);
 
-//	ret = process_pkt(qh, nfa);
-	ret = process_pkt_1(qh, nfa);
-/*
+	ret = process_pkt_2(pkt_data, pkt_len);
 	if(ret == PKT_ACCEPT){
 		return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 	}
 	if(ret == PKT_DROP){
 		return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
 	}
-*/
 }
 
 int main(int argc, char **argv)
@@ -637,11 +617,13 @@ int main(int argc, char **argv)
 
 //	printf("opening library handle\n");
 
-	if(argc < 2){
+	if(argc < 4){
 		perror("no interface found");
 		exit(0);
 	}
 	strcpy(intf, argv[1]);
+    frag_size = atol(argv[2]);
+    frag_intv = atol(argv[3]);
 	if(sock_init()){
 		exit(0);
 	}
@@ -699,7 +681,7 @@ int main(int argc, char **argv)
 
 	while ((rv = recv(fd, buf, sizeof(buf), 0)))
 	{
-		printf("##pkt received\n");
+//		printf("##pkt received\n");
 		nfq_handle_packet(h, buf, rv);
 //		dump_pkt("payload_full:", buf, rv);
 	}
