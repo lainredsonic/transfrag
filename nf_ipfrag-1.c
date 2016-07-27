@@ -1,37 +1,124 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdarg.h>
+
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <linux/types.h>
-#include <linux/netfilter.h>		
+#include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
-#include <errno.h>
-#include <string.h>
-#include <signal.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/timeb.h>
 
-# define __force
+#define  CRITICAL_SECTION   pthread_mutex_t
+#define __force
+#define MAXLOGSIZE 20000000
+#define MAXLINSIZE 16000
 
-//iptables -A OUTPUT -p tcp --dport 80 -m string --algo bm --string "Host: "  -j NFQUEUE
+char logfilename1[]="/mnt/wwn-part1/nf_frag-1.log";
 
+char logfilename2[]="/mnt/wwn-part1/nf_frag-2.log";
 
-char intf[255]; 
+static char logstr[MAXLINSIZE+1];
+
+char datestr[16];
+char timestr[16];
+char mss[4];
+CRITICAL_SECTION cs_log;
+FILE *flog;
+
+char intf[255];
 int rawfd;
+
 int frag_size = 2;
 int frag_intv = 10; //ms
+int rst_ttl = 10;
+
+int log_fd;
+char logbuf[3500] = {0,};
 
 
-static inline unsigned short from32to16(unsigned a) 
+void Lock(CRITICAL_SECTION *l)
 {
-	unsigned short b = a >> 16; 
+    pthread_mutex_lock(l);
+}
+
+void Unlock(CRITICAL_SECTION *l)
+{
+    pthread_mutex_unlock(l);
+}
+
+void Log_open()
+{
+    flog=fopen(logfilename1,"a");
+    setvbuf(flog, NULL, _IOLBF, 0);
+}
+
+void Log_close()
+{
+    fclose(flog);
+}
+
+
+void LogV(const char *pszFmt,va_list argp)
+{
+
+    struct tm *now;
+    struct timeb tb;
+
+    if (NULL==pszFmt||0==pszFmt[0])
+        return;
+    vsnprintf(logstr,MAXLINSIZE,pszFmt,argp);
+    ftime(&tb);
+    now=localtime(&tb.time);
+    sprintf(datestr,"%04d-%02d-%02d",now->tm_year+1900,now->tm_mon+1,now->tm_mday);
+    sprintf(timestr,"%02d:%02d:%02d",now->tm_hour     ,now->tm_min  ,now->tm_sec );
+    sprintf(mss,"%03d",tb.millitm);
+//  printf("%s %s.%s %s",datestr,timestr,mss,logstr);
+//  flog=fopen(logfilename1,"a");
+    if (NULL!=flog) {
+        fprintf(flog,"%s %s.%s %s",datestr,timestr,mss,logstr);
+        if (ftell(flog)>MAXLOGSIZE) {
+            Log_close();
+            if (rename(logfilename1,logfilename2)) {
+                remove(logfilename2);
+                rename(logfilename1,logfilename2);
+            }
+            Log_open();
+        } else {
+//          fclose(flog);
+        }
+    }
+}
+
+void Log(const char *pszFmt,...)
+{
+    va_list argp;
+    Lock(&cs_log);
+    va_start(argp,pszFmt);
+    LogV(pszFmt,argp);
+    va_end(argp);
+    Unlock(&cs_log);
+}
+
+static inline unsigned short from32to16(unsigned a)
+{
+	unsigned short b = a >> 16;
 	asm("addw %w2,%w0\n\t"
-	    "adcw $0,%w0\n" 
+	    "adcw $0,%w0\n"
 	    : "=r" (b)
 	    : "0" (b), "r" (a));
 	return b;
 }
-
 
 static inline unsigned add32_with_carry(unsigned a, unsigned b)
 {
@@ -41,9 +128,6 @@ static inline unsigned add32_with_carry(unsigned a, unsigned b)
 	    : "0" (a), "rm" (b));
 	return a;
 }
-
-
-
 
 static unsigned do_csum(const unsigned char *buff, unsigned len)
 {
@@ -132,15 +216,11 @@ static unsigned do_csum(const unsigned char *buff, unsigned len)
 	return result;
 }
 
-
-
 __wsum csum_partial(const void *buff, int len, __wsum sum)
 {
 	return (__force __wsum)add32_with_carry(do_csum(buff, len),
 						(__force uint32_t)sum);
 }
-
-
 
 static inline __sum16 csum_fold(__wsum sum)
 {
@@ -151,7 +231,6 @@ static inline __sum16 csum_fold(__wsum sum)
 	      "0" ((__force uint32_t)sum & 0xffff0000));
 	return (__force __sum16)(~(__force uint32_t)sum >> 16);
 }
-
 
 static inline __wsum
 csum_tcpudp_nofold(__be32 saddr, __be32 daddr, unsigned short len,
@@ -167,8 +246,6 @@ csum_tcpudp_nofold(__be32 saddr, __be32 daddr, unsigned short len,
 	return sum;
 }
 
-
-
 static inline __sum16
 csum_tcpudp_magic(__be32 saddr, __be32 daddr, unsigned short len,
 		  unsigned short proto, __wsum sum)
@@ -176,13 +253,12 @@ csum_tcpudp_magic(__be32 saddr, __be32 daddr, unsigned short len,
 	return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));
 }
 
-
-
 void sa_hdl(int signo)
 {
 	system("iptables -F");
+    Log_close();
 	printf("see you\n");
-	sleep(3);
+	sleep(1);
 	exit(0);
 }
 
@@ -258,7 +334,6 @@ int sock_init()
 	return ret;
 }
 
-
 enum {
 	PKT_ACCEPT = 0,
 	PKT_DROP,
@@ -282,8 +357,6 @@ static void dump_pkt(char *s, unsigned char *pkt, int len)
 	}
 	printf("\n");
 }
-
-
 
 static u_int32_t print_pkt (struct nfq_data *tb)
 {
@@ -371,102 +444,7 @@ static uint16_t checksum (uint16_t *addr, int len)
 	return (answer);
 }
 
-int process_pkt_1(unsigned char *data, u_int16_t pkt_len)
-{
-	u_int16_t pkt1_len;
-	u_int16_t pkt2_len;
-	struct ip_pkt *ipk = NULL;
-	struct ip_pkt *ipk2 = NULL;
-	struct sockaddr_in da;
-	unsigned char data2[3500];
-	char *strloc = NULL;
-	int offset;
-	char request[3500] = {0,};
-	u_int16_t tcp_hdr_len = 0;
-
-	ipk = (struct ip_pkt *)data;
-	ipk2 = (struct ip_pkt *)data2;
-
-//	printf("ttl:%u\n", (ipk->iph).ttl);
-
-	if((ipk->iph).ttl == 199){
-		ipk->iph.ttl = 199;
-		ipk->iph.check = 0;
-		ipk->iph.check = checksum((uint16_t *)data, 20);
-//		nfq_set_verdict(qh, id, NF_ACCEPT, pkt_len, data);
-		printf("pass\n");
-		return PKT_ACCEPT;
-	}
-
-	tcp_hdr_len = ipk->tcph.th_off * 4;
-
-	if(strloc = strstr((char *)ipk+20+tcp_hdr_len, "GET")){
-		offset = strloc-(char *)data;
-		if(ntohs(ipk->iph.tot_len)-offset<=0){			//扫到上次缓冲区残馀数据的部分
-//			nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-			printf("offset\n");
-			return PKT_ACCEPT;
-		}
-		strncpy(request, strloc, ntohs(ipk->iph.tot_len)-offset);
-		printf("str_tcp_offset:%d\ntcp_request:\n%s", offset, request);
-		memset(request, 0, 3500);
-	}else{
-		printf("not found\n");	
-//		nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-		return PKT_ACCEPT;
-	}
-//	offset += 5; //skip "GET "
-	offset += 2; //split "GET " to avoid censorship
-	memcpy(data2, data, pkt_len);
-	pkt1_len = offset;
-	pkt2_len = ntohs(ipk->iph.tot_len) - offset + 20 + tcp_hdr_len;
-	memcpy(data2+20+tcp_hdr_len, data+pkt1_len, ntohs(ipk->iph.tot_len)-offset);
-
-	ipk->iph.ttl = 199;
-	ipk->iph.tot_len = htons(pkt1_len);
-	ipk->iph.check = 0;
-	ipk->iph.check = checksum((uint16_t *)data, 20);
-	ipk->tcph.th_sum = 0;
-	ipk->tcph.th_sum = csum_tcpudp_magic(ipk->iph.saddr,
-				ipk->iph.daddr,
-				pkt1_len-20, IPPROTO_TCP,
-				csum_partial((unsigned char *)(&ipk->tcph), pkt1_len-20, 0));
-
-	ipk2->iph.ttl = 199;
-	ipk2->iph.tot_len = htons(pkt2_len);
-	ipk2->iph.check = 0;
-	ipk2->iph.check = checksum((uint16_t *)data2, 20);
-	ipk2->tcph.th_seq = htonl(ntohl(ipk->tcph.th_seq)+(pkt1_len - 20 - tcp_hdr_len));
-	ipk2->tcph.th_sum = 0;
-	ipk2->tcph.th_sum = csum_tcpudp_magic(ipk2->iph.saddr,
-				ipk2->iph.daddr,
-				pkt2_len-20, IPPROTO_TCP,
-				csum_partial((unsigned char *)(&ipk2->tcph), pkt2_len-20, 0));
-
-	memset(&da, 0, sizeof(struct sockaddr));
-	da.sin_addr.s_addr = (ipk->iph).daddr;
-
-//    printf("pkt1_len:%d\n", pkt1_len);
-//    printf("pkt2_len:%d\n", pkt2_len);
-
-	if(sendto(rawfd, data, pkt1_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
-		perror("sendto1 failed");
-		exit(errno);
-	}
-
-    usleep(frag_intv*1000);
-
-	if(sendto(rawfd, data2, pkt2_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
-		perror("sendto2 failed");
-		exit(errno);
-	}
-
-//	nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-	return PKT_DROP;
-}
-
-
-int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
+int process_pkt(unsigned char *data, u_int16_t pkt_len)
 {
 	u_int16_t pkt1_len;
 	u_int16_t pkt2_len;
@@ -481,6 +459,7 @@ int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
 	u_int16_t tcp_hdr_len = 0;
     unsigned int last_frag = 0;
     unsigned int frag_count = 0;
+    unsigned char request_addr[INET_ADDRSTRLEN+1];
 
 	ipk = (struct ip_pkt *)data;
 	ipk2 = (struct ip_pkt *)data2;
@@ -498,7 +477,8 @@ int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
 
 	tcp_hdr_len = ipk->tcph.th_off * 4;
 
-	if(strloc = strstr((char *)ipk+20+tcp_hdr_len, "GET")){
+	if((strloc = strstr((char *)ipk+20+tcp_hdr_len, "GET")) \
+        || (strloc = strstr((char *)ipk+20+tcp_hdr_len, "POST"))){
 		offset = strloc-(char *)data;
 		if(ntohs(ipk->iph.tot_len)-offset<=0){			//扫到上次缓冲区残馀数据的部分
 //			nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
@@ -506,7 +486,8 @@ int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
 			return PKT_ACCEPT;
 		}
 		strncpy(request, strloc, ntohs(ipk->iph.tot_len)-offset);
-		printf("str_tcp_offset:%d\ntcp_request:\n%s", offset, request);
+        inet_ntop(AF_INET, &ipk->iph.saddr, request_addr, sizeof(struct sockaddr));
+		Log("src:%s\nstr_tcp_offset:%d\ntcp_request:\n%s", request_addr, offset, request);
 		memset(request, 0, 3500);
 	}else{
 		printf("not found\n");	
@@ -517,6 +498,7 @@ int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
     rest_payload_len = ntohs(ipk->iph.tot_len) - 20 - tcp_hdr_len - 2; //split "GE T " to avoid censorship
 
     memset(&da, 0, sizeof(struct sockaddr));
+    da.sin_family = AF_INET;
     da.sin_addr.s_addr = (ipk->iph).daddr;
 
     pkt1_len = offset;
@@ -530,12 +512,33 @@ int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
                 pkt1_len-20, IPPROTO_TCP,
                 csum_partial((unsigned char *)(&ipk->tcph), pkt1_len-20, 0));
 
+
+    pkt2_len = 20 +tcp_hdr_len;
+    memcpy(data2, data, pkt2_len);
+    ipk2->iph.ttl = rst_ttl;
+    ipk2->iph.tot_len = htons(pkt2_len);
+    ipk2->iph.check = 0;
+    ipk2->iph.check = checksum((uint16_t *)data2, 20);
+    ipk2->tcph.th_flags = TH_RST|TH_ACK;
+    ipk2->tcph.th_sum = 0;
+    ipk2->tcph.th_sum = csum_tcpudp_magic(ipk2->iph.saddr,
+                ipk2->iph.daddr,
+                pkt2_len-20, IPPROTO_TCP,
+                csum_partial((unsigned char *)(&ipk2->tcph), pkt2_len-20, 0));
+    if(sendto(rawfd, data2, pkt2_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
+        perror("sendto rst failed");
+        exit(errno);
+    }
+
+    usleep(10000);
+
     if(sendto(rawfd, data, pkt1_len, 0, (struct sockaddr *)&da, sizeof(struct sockaddr)) < 0){
         perror("sendto1 failed");
         exit(errno);
     }
 
-    usleep(frag_intv*1000);
+    if(frag_intv)
+        usleep(frag_intv*1000);
 
 
     while(rest_payload_len > 0 && !last_frag){
@@ -570,6 +573,7 @@ int process_pkt_2(unsigned char *data, u_int16_t pkt_len)
             exit(errno);
         }
 
+    if(frag_intv)
         usleep(frag_intv*1000);
 
         frag_count++;
@@ -598,7 +602,7 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, struct nfq_data *
 	u_int32_t id = ntohl(ph->packet_id);
 	u_int16_t pkt_len = nfq_get_payload(nfa, &pkt_data);
 
-	ret = process_pkt_2(pkt_data, pkt_len);
+	ret = process_pkt(pkt_data, pkt_len);
 	if(ret == PKT_ACCEPT){
 		return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 	}
@@ -614,16 +618,16 @@ int main(int argc, char **argv)
 	int fd;
 	int rv;
 	char buf[4096] __attribute__ ((aligned));
-
 //	printf("opening library handle\n");
 
-	if(argc < 4){
+	if(argc < 5){
 		perror("no interface found");
 		exit(0);
 	}
 	strcpy(intf, argv[1]);
     frag_size = atol(argv[2]);
     frag_intv = atol(argv[3]);
+    rst_ttl = atol(argv[4]);
 	if(sock_init()){
 		exit(0);
 	}
@@ -660,6 +664,7 @@ int main(int argc, char **argv)
 	}
 
 	fw();
+    Log_open();
 /*
 	sigemptyset(&sa.sa_mask);
 	if(sigaction(SIGINT, &sa, NULL)){
@@ -671,7 +676,7 @@ int main(int argc, char **argv)
 		exit(0);
 	}
 */
-	
+
 	Signal(SIGINT, &sa_hdl);
 	Signal(SIGTERM, &sa_hdl);
 
@@ -698,6 +703,7 @@ int main(int argc, char **argv)
 
 	printf("closing library handle\n");
 	nfq_close(h);
+    Log_close();
 
 	exit(0);
 }
